@@ -4,7 +4,9 @@ A live browser dashboard that streams Claude's internal activity in real time â€
 thinking blocks, tool calls, tool results, and responses â€” by watching the
 JSONL session files that Claude Code writes to `~/.claude/projects/`.
 
-![screenshot placeholder](https://img.shields.io/badge/python-3.8+-blue) ![license](https://img.shields.io/badge/license-MIT-green)
+![python](https://img.shields.io/badge/python-3.8+-blue) ![license](https://img.shields.io/badge/license-MIT-green)
+
+![demo](mindofclaude-animated-demo.gif)
 
 ## What it looks like
 
