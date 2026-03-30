@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""Inside the Mind of Claude — live JSONL session viewer.
+
+Watches ~/.claude/projects/**/*.jsonl and streams thinking, tool calls,
+and tool results to a browser page via Server-Sent Events.
+
+Usage: mind-of-claude [port]   (default port: 7777)
+"""
+
+import html as _html
+import json
+import queue
+import socketserver
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from datetime import datetime, timezone
+
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 7777
+HOST = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+POLL_INTERVAL = 0.5          # seconds between file scans
+MAX_BUFFER = 1000            # events kept in memory for late-joining clients
+INITIAL_FILE_AGE_HOURS = 6   # replay files modified within this window
+
+# ── global state ──────────────────────────────────────────────────────────────
+_clients: list[queue.Queue] = []
+_clients_lock = threading.Lock()
+_event_buffer: list[str] = []          # JSON-encoded event strings
+_buffer_lock = threading.Lock()
+_file_positions: dict[str, int] = {}   # str(path) -> bytes read so far
+
+
+def broadcast(event: dict) -> None:
+    data = json.dumps(event)
+    with _buffer_lock:
+        _event_buffer.append(data)
+        if len(_event_buffer) > MAX_BUFFER:
+            _event_buffer.pop(0)
+    with _clients_lock:
+        for q in _clients:
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                pass
+
+
+def parse_entry(entry: dict, source_file: Path) -> list[dict]:
+    events = []
+    entry_type = entry.get("type", "")
+    timestamp = entry.get("timestamp", "")
+    session_id = source_file.stem[:8]
+
+    # Make project label human-readable
+    proj = source_file.parent.name
+    for prefix in ("-Users-ryan-devel-", "-Users-ryan-"):
+        if proj.startswith(prefix):
+            proj = "~/" + proj[len(prefix):].replace("-", "/", 3)
+            break
+    if proj == "-Users-ryan":
+        proj = "~"
+
+    base = {"ts": timestamp, "session": session_id, "project": proj}
+
+    if entry_type == "assistant":
+        content = entry.get("message", {}).get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                btype = block.get("type", "")
+                if btype == "thinking":
+                    events.append({**base, "kind": "thinking",
+                                   "text": block.get("thinking", "")})
+                elif btype == "tool_use":
+                    events.append({**base, "kind": "tool_use",
+                                   "name": block.get("name", ""),
+                                   "input": block.get("input", {})})
+                elif btype == "text":
+                    text = block.get("text", "").strip()
+                    if text:
+                        events.append({**base, "kind": "assistant_text",
+                                       "text": text})
+
+    elif entry_type == "user":
+        content = entry.get("message", {}).get("content", [])
+        if isinstance(content, str):
+            if content.strip():
+                events.append({**base, "kind": "user_text",
+                               "text": content.strip()})
+        elif isinstance(content, list):
+            for block in content:
+                btype = block.get("type", "")
+                if btype == "tool_result":
+                    rc = block.get("content", "")
+                    if isinstance(rc, list):
+                        rc = "\n".join(
+                            item.get("text", "") for item in rc
+                            if item.get("type") == "text"
+                        )
+                    events.append({**base, "kind": "tool_result",
+                                   "error": bool(block.get("is_error")),
+                                   "text": str(rc)})
+                elif btype == "text":
+                    text = block.get("text", "").strip()
+                    if text:
+                        events.append({**base, "kind": "user_text",
+                                       "text": text})
+
+    return events
+
+
+def watcher() -> None:
+    while True:
+        try:
+            cutoff = time.time() - INITIAL_FILE_AGE_HOURS * 3600
+            for fpath in PROJECTS_DIR.rglob("*.jsonl"):
+                try:
+                    stat = fpath.stat()
+                    key = str(fpath)
+                    prev = _file_positions.get(key)
+
+                    if prev is None:
+                        _file_positions[key] = stat.st_size
+                        if stat.st_mtime >= cutoff:
+                            with open(fpath, "rb") as f:
+                                raw = f.read()
+                            for line in raw.split(b"\n"):
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        ev_list = parse_entry(
+                                            json.loads(line), fpath)
+                                        for ev in ev_list:
+                                            ev["new"] = False
+                                            broadcast(ev)
+                                    except Exception:
+                                        pass
+
+                    elif stat.st_size > prev:
+                        with open(fpath, "rb") as f:
+                            f.seek(prev)
+                            new_bytes = f.read()
+                        _file_positions[key] = stat.st_size
+                        for line in new_bytes.split(b"\n"):
+                            line = line.strip()
+                            if line:
+                                try:
+                                    ev_list = parse_entry(
+                                        json.loads(line), fpath)
+                                    for ev in ev_list:
+                                        ev["new"] = True
+                                        broadcast(ev)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(POLL_INTERVAL)
+
+
+# ── HTML page ─────────────────────────────────────────────────────────────────
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inside the Mind of Claude</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #07070f;
+  --header-bg: rgba(7,7,15,0.92);
+  --card-thinking: #130a24;
+  --card-tool:     #080f20;
+  --card-result:   #081408;
+  --card-error:    #1a0808;
+  --card-asst:     #0d0d18;
+  --card-user:     #0a0a0a;
+  --border-thinking: #6d28d9;
+  --border-tool:     #1d4ed8;
+  --border-result:   #15803d;
+  --border-error:    #b91c1c;
+  --border-asst:     #374151;
+  --border-user:     #1f2937;
+}
+
+body {
+  background: var(--bg);
+  color: #dde1f0;
+  font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code', monospace;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── header ── */
+header {
+  position: sticky; top: 0; z-index: 100;
+  background: var(--header-bg);
+  border-bottom: 1px solid #1a1a30;
+  backdrop-filter: blur(12px);
+  padding: 10px 20px;
+  display: flex; align-items: center; gap: 16px;
+}
+
+.logo {
+  font-size: 1rem; font-weight: 800;
+  letter-spacing: 0.12em; text-transform: uppercase;
+  background: linear-gradient(100deg, #a78bfa 0%, #60a5fa 50%, #c084fc 100%);
+  background-size: 200% auto;
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text;
+  animation: shimmer 4s linear infinite;
+  white-space: nowrap;
+}
+
+@keyframes shimmer { to { background-position: 200% center; } }
+
+.live-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: #22c55e; flex-shrink: 0;
+  animation: pulse 2s ease-in-out infinite;
+}
+@keyframes pulse { 0%,100%{opacity:1;box-shadow:0 0 4px #22c55e} 50%{opacity:.3;box-shadow:none} }
+
+.stats {
+  display: flex; gap: 14px; font-size: 0.72rem; color: #4a4a7a;
+  flex: 1;
+}
+.stats span { white-space: nowrap; }
+.stats b { color: #7070b0; }
+
+.controls { display: flex; gap: 8px; margin-left: auto; }
+.ctrl-btn {
+  background: #1a1a2e; border: 1px solid #2a2a4a;
+  color: #8080b0; border-radius: 5px;
+  padding: 4px 10px; font-size: 0.72rem;
+  cursor: pointer; font-family: inherit;
+  transition: all .15s;
+}
+.ctrl-btn:hover { background: #22224a; color: #a0a0d0; }
+.ctrl-btn.active { background: #2a1a4a; border-color: #6d28d9; color: #a78bfa; }
+
+/* ── stream ── */
+#stream {
+  flex: 1; overflow-y: auto;
+  padding: 14px 18px;
+  display: flex; flex-direction: column; gap: 6px;
+  scroll-behavior: smooth;
+}
+
+#empty {
+  text-align: center; color: #1e1e38;
+  padding: 80px 40px; font-size: 0.85rem; line-height: 2.2;
+}
+#empty .big { font-size: 2rem; margin-bottom: 8px; }
+
+/* ── cards ── */
+.card {
+  border-radius: 7px;
+  padding: 10px 14px;
+  font-size: 0.78rem;
+  line-height: 1.55;
+  border-left: 3px solid transparent;
+  position: relative;
+  opacity: 1;
+}
+
+.card.is-new { animation: slideIn .35s ease; }
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(-6px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+.card.thinking     { background: var(--card-thinking); border-color: var(--border-thinking); }
+.card.tool_use     { background: var(--card-tool);     border-color: var(--border-tool); }
+.card.tool_result  { background: var(--card-result);   border-color: var(--border-result); }
+.card.tool_result.error { background: var(--card-error); border-color: var(--border-error); }
+.card.assistant_text{ background: var(--card-asst);    border-color: var(--border-asst); }
+.card.user_text    { background: var(--card-user);     border-color: var(--border-user); }
+
+/* hide by filter */
+.card.hidden { display: none; }
+
+.card-meta {
+  display: flex; align-items: center; gap: 7px;
+  margin-bottom: 5px; font-size: 0.67rem; color: #40406a;
+}
+.card-icon { font-size: 0.85rem; }
+.card-kind {
+  font-weight: 700; letter-spacing: .07em; text-transform: uppercase;
+}
+.card.thinking      .card-kind { color: #8b5cf6; }
+.card.tool_use      .card-kind { color: #3b82f6; }
+.card.tool_result   .card-kind { color: #22c55e; }
+.card.tool_result.error .card-kind { color: #f87171; }
+.card.assistant_text .card-kind { color: #6b7280; }
+.card.user_text      .card-kind { color: #4b5563; }
+
+.card-session {
+  background: rgba(255,255,255,.06); border-radius: 3px;
+  padding: 1px 5px; font-size: .62rem; color: #50507a;
+}
+.card-ts { margin-left: auto; color: #2a2a4a; font-size: .62rem; }
+
+/* body */
+.card-body {
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 220px; overflow: hidden;
+  position: relative;
+  transition: max-height .25s ease;
+}
+.card-body.expanded { max-height: 2400px; }
+
+.card-body:not(.expanded).clipped::after {
+  content: '';
+  position: absolute; bottom: 0; left: 0; right: 0; height: 48px;
+  background: linear-gradient(transparent, var(--card-bg, #130a24));
+  pointer-events: none;
+}
+
+.card.tool_use      .card-body::after { --card-bg: var(--card-tool); }
+.card.tool_result   .card-body::after { --card-bg: var(--card-result); }
+.card.tool_result.error .card-body::after { --card-bg: var(--card-error); }
+.card.assistant_text .card-body::after { --card-bg: var(--card-asst); }
+.card.user_text      .card-body::after { --card-bg: var(--card-user); }
+
+.expand-btn {
+  background: none; border: none; cursor: pointer;
+  font-size: .65rem; color: #40406a; margin-top: 3px;
+  padding: 0; font-family: inherit;
+}
+.expand-btn:hover { color: #8080b0; }
+
+.tool-name {
+  font-size: .82rem; font-weight: 700; color: #60a5fa; margin-bottom: 5px;
+}
+pre.json {
+  background: rgba(0,0,0,.35); border-radius: 5px;
+  padding: 8px 10px; overflow-x: auto;
+  font-size: .7rem; line-height: 1.45; color: #94a3b8;
+}
+
+/* ── scroll button ── */
+#scroll-btn {
+  position: fixed; bottom: 22px; right: 22px;
+  background: #6d28d9; color: #fff;
+  border: none; border-radius: 50%;
+  width: 38px; height: 38px; font-size: 17px;
+  cursor: pointer; display: none; align-items: center; justify-content: center;
+  box-shadow: 0 4px 18px rgba(109,40,217,.45); z-index: 200;
+  transition: opacity .2s;
+}
+#scroll-btn.visible { display: flex; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="live-dot"></div>
+  <div class="logo">⟡ Inside the Mind of Claude</div>
+  <div class="stats">
+    <span><b id="ev-count">0</b> events</span>
+    <span><b id="sess-count">0</b> sessions</span>
+    <span id="last-kind"></span>
+  </div>
+  <div class="controls">
+    <button class="ctrl-btn active" data-filter="thinking"   title="Toggle thinking">🧠 Think</button>
+    <button class="ctrl-btn active" data-filter="tool_use"   title="Toggle tool calls">🔧 Calls</button>
+    <button class="ctrl-btn active" data-filter="tool_result" title="Toggle tool results">📤 Results</button>
+    <button class="ctrl-btn active" data-filter="assistant_text" title="Toggle responses">💬 Resp</button>
+    <button class="ctrl-btn active" data-filter="user_text"  title="Toggle user messages">👤 User</button>
+    <button class="ctrl-btn" id="clear-btn">✕ Clear</button>
+  </div>
+</header>
+
+<div id="stream">
+  <div id="empty">
+    <div class="big">🧠</div>
+    Scanning <code>~/.claude/projects/</code>&hellip;<br>
+    Waiting for Claude activity
+  </div>
+</div>
+
+<button id="scroll-btn" title="Jump to bottom">↓</button>
+
+<script>
+const streamEl   = document.getElementById('stream');
+const emptyEl    = document.getElementById('empty');
+const evCountEl  = document.getElementById('ev-count');
+const sessCountEl= document.getElementById('sess-count');
+const lastKindEl = document.getElementById('last-kind');
+const scrollBtn  = document.getElementById('scroll-btn');
+
+let evCount = 0, sessions = new Set(), autoScroll = true;
+const filters = new Set(['thinking','tool_use','tool_result','assistant_text','user_text']);
+
+// ── filter buttons ──────────────────────────────────────────────────────────
+document.querySelectorAll('[data-filter]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const f = btn.dataset.filter;
+    if (filters.has(f)) { filters.delete(f); btn.classList.remove('active'); }
+    else                 { filters.add(f);    btn.classList.add('active'); }
+    document.querySelectorAll('.card').forEach(c => {
+      c.classList.toggle('hidden', !filters.has(c.dataset.kind));
+    });
+  });
+});
+
+document.getElementById('clear-btn').addEventListener('click', () => {
+  document.querySelectorAll('.card').forEach(c => c.remove());
+  evCount = 0; sessions.clear();
+  evCountEl.textContent = '0';
+  sessCountEl.textContent = '0';
+  if (!emptyEl.parentNode) streamEl.prepend(emptyEl);
+});
+
+// ── scroll tracking ─────────────────────────────────────────────────────────
+function scrollToBottom() {
+  streamEl.scrollTo({ top: streamEl.scrollHeight, behavior: 'smooth' });
+  autoScroll = true;
+  scrollBtn.classList.remove('visible');
+}
+streamEl.addEventListener('scroll', () => {
+  const atBottom = streamEl.scrollHeight - streamEl.scrollTop - streamEl.clientHeight < 120;
+  autoScroll = atBottom;
+  scrollBtn.classList.toggle('visible', !atBottom);
+});
+scrollBtn.addEventListener('click', scrollToBottom);
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function trunc(s, n) {
+  s = String(s);
+  if (s.length <= n) return s;
+  return s.slice(0, n) + `\n… [${(s.length-n).toLocaleString()} chars omitted]`;
+}
+function fmtTs(ts) {
+  if (!ts) return '';
+  try { return new Date(ts).toLocaleTimeString('en-US',{hour12:false}); }
+  catch { return ts.slice(11,19)||''; }
+}
+
+const ICONS  = { thinking:'🧠', tool_use:'🔧', tool_result:'📤', assistant_text:'💬', user_text:'👤' };
+const LABELS = { thinking:'Thinking', tool_use:'Tool Call', tool_result:'Result', assistant_text:'Response', user_text:'User' };
+
+// ── render card ──────────────────────────────────────────────────────────────
+function makeCard(ev) {
+  const div = document.createElement('div');
+  div.className = 'card ' + ev.kind + (ev.error?' error':'') + (ev.new?' is-new':'');
+  div.dataset.kind = ev.kind;
+  if (!filters.has(ev.kind)) div.classList.add('hidden');
+
+  const icon  = ICONS[ev.kind]  || '·';
+  const label = LABELS[ev.kind] || ev.kind;
+  const errLabel = ev.error ? ' Error' : '';
+
+  let bodyHtml = '';
+
+  if (ev.kind === 'tool_use') {
+    const raw = JSON.stringify(ev.input, null, 2);
+    bodyHtml = `<div class="tool-name">${esc(ev.name)}</div>`
+             + `<pre class="json card-body">${esc(trunc(raw, 2000))}</pre>`;
+  } else {
+    const text = trunc(ev.text || '', ev.kind === 'thinking' ? 900 : 600);
+    bodyHtml = `<pre class="card-body">${esc(text)}</pre>`;
+  }
+
+  div.innerHTML = `
+    <div class="card-meta">
+      <span class="card-icon">${icon}</span>
+      <span class="card-kind">${label}${errLabel}</span>
+      <span class="card-session">${esc(ev.project)} · ${esc(ev.session)}</span>
+      <span class="card-ts">${fmtTs(ev.ts)}</span>
+    </div>
+    ${bodyHtml}
+  `;
+
+  // clip detection + expand button
+  const body = div.querySelector('.card-body');
+  if (body) {
+    requestAnimationFrame(() => {
+      if (body.scrollHeight > body.clientHeight + 10) {
+        body.classList.add('clipped');
+        const btn = document.createElement('button');
+        btn.className = 'expand-btn';
+        btn.textContent = '▼ expand';
+        btn.addEventListener('click', () => {
+          const exp = body.classList.toggle('expanded');
+          body.classList.toggle('clipped', !exp);
+          btn.textContent = exp ? '▲ collapse' : '▼ expand';
+        });
+        div.appendChild(btn);
+      }
+    });
+  }
+
+  return div;
+}
+
+// ── add event to stream ───────────────────────────────────────────────────────
+function addEvent(ev) {
+  if (emptyEl.parentNode) emptyEl.remove();
+
+  evCount++;
+  sessions.add(ev.session);
+  evCountEl.textContent  = evCount.toLocaleString();
+  sessCountEl.textContent = sessions.size;
+  lastKindEl.textContent = (ICONS[ev.kind]||'') + ' ' + (LABELS[ev.kind]||ev.kind);
+
+  const card = makeCard(ev);
+  streamEl.appendChild(card);
+
+  if (autoScroll) {
+    card.scrollIntoView({ behavior: ev.new ? 'smooth' : 'instant', block: 'end' });
+  }
+}
+
+// ── SSE connection ────────────────────────────────────────────────────────────
+function connect() {
+  const es = new EventSource('/stream');
+  es.onmessage = e => {
+    try { addEvent(JSON.parse(e.data)); }
+    catch(err) { console.error('parse error', err, e.data); }
+  };
+  es.onerror = () => {
+    console.log('SSE error — reconnecting in 2s');
+    es.close();
+    setTimeout(connect, 2000);
+  };
+}
+connect();
+</script>
+</body>
+</html>
+"""
+
+
+# ── HTTP handler ──────────────────────────────────────────────────────────────
+class Handler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        if self.path == "/":
+            body = HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+
+            client_q: queue.Queue = queue.Queue(maxsize=500)
+
+            with _clients_lock:
+                _clients.append(client_q)
+
+            try:
+                # Replay buffered events for this client
+                with _buffer_lock:
+                    snapshot = list(_event_buffer)
+                for data in snapshot:
+                    self.wfile.write(f"data: {data}\n\n".encode())
+                self.wfile.flush()
+
+                # Stream live events
+                while True:
+                    try:
+                        data = client_q.get(timeout=15)
+                        self.wfile.write(f"data: {data}\n\n".encode())
+                        self.wfile.flush()
+                    except queue.Empty:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                with _clients_lock:
+                    try:
+                        _clients.remove(client_q)
+                    except ValueError:
+                        pass
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass  # silence access log
+
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    t = threading.Thread(target=watcher, daemon=True, name="watcher")
+    t.start()
+
+    server = ThreadedHTTPServer((HOST, PORT), Handler)
+    url = f"http://{HOST}:{PORT}"
+    print(f"🧠  Inside the Mind of Claude")
+    print(f"    {url}")
+    print(f"    watching {PROJECTS_DIR}")
+    print(f"    Ctrl-C to stop")
+
+    import webbrowser
+    webbrowser.open(url)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
