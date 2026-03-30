@@ -6,7 +6,7 @@ JSONL session files that Claude Code writes to `~/.claude/projects/`.
 
 ![python](https://img.shields.io/badge/python-3.8+-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
-![demo](mindofclaude-animated-demo.gif)
+![demo](mindofclaude-animated-demo-v2.gif)
 
 ## What it looks like
 
